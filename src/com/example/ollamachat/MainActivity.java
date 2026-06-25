@@ -1,14 +1,19 @@
 package com.example.ollamachat;
 
 import android.app.Activity;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.text.method.ScrollingMovementMethod;
+import android.text.method.LinkMovementMethod;
+import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -29,6 +34,8 @@ import java.nio.charset.Charset;
  * Talks to a local Ollama server over its HTTP /api/chat endpoint, keeping the
  * running conversation in memory so the model has context across turns.
  * Pure Android framework only — no Compose, no support/AndroidX libraries.
+ * The chat bubbles are built programmatically (rounded GradientDrawables) so
+ * the project ships without any drawable assets.
  */
 public class MainActivity extends Activity {
 
@@ -38,25 +45,41 @@ public class MainActivity extends Activity {
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
+    // Palette
+    private static final int COLOR_USER = 0xFF0B5FFF;
+    private static final int COLOR_USER_TEXT = 0xFFFFFFFF;
+    private static final int COLOR_BOT = 0xFFFFFFFF;
+    private static final int COLOR_BOT_TEXT = 0xFF1A1A1A;
+    private static final int COLOR_BOT_STROKE = 0xFFE2E6EC;
+    private static final int COLOR_SEND = 0xFF0B5FFF;
+    private static final int COLOR_SEND_DISABLED = 0xFFB6C2D6;
+    private static final int COLOR_HINT_TEXT = 0xFF8A9099;
+
     private final JSONArray history = new JSONArray();
     private final Handler ui = new Handler(Looper.getMainLooper());
 
-    private TextView conversation;
+    private LinearLayout container;
+    private ScrollView scroll;
     private EditText input;
     private Button send;
-    private ScrollView scroll;
+    private float density;
+    private int maxBubbleWidth;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        conversation = (TextView) findViewById(R.id.conversation);
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        density = dm.density;
+        maxBubbleWidth = (int) (dm.widthPixels * 0.80f);
+
+        container = (LinearLayout) findViewById(R.id.container);
+        scroll = (ScrollView) findViewById(R.id.scroll);
         input = (EditText) findViewById(R.id.input);
         send = (Button) findViewById(R.id.send);
-        scroll = (ScrollView) findViewById(R.id.scroll);
 
-        conversation.setMovementMethod(new ScrollingMovementMethod());
+        styleInputBar();
 
         send.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -65,7 +88,6 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Let the keyboard "Send" action submit too.
         input.setOnEditorActionListener(new TextView.OnEditorActionListener() {
             @Override
             public boolean onEditorAction(TextView v, int actionId, android.view.KeyEvent event) {
@@ -77,8 +99,101 @@ public class MainActivity extends Activity {
             }
         });
 
-        appendLine("Connected to:\n" + SERVER_URL + "\nModel: " + MODEL + "\n");
+        addSystemNote("Connected to " + SERVER_URL.replace("/api/chat", "")
+                + "\n" + MODEL);
     }
+
+    // ---------------------------------------------------------------- styling
+
+    private int dp(float v) {
+        return (int) (v * density + 0.5f);
+    }
+
+    private void styleInputBar() {
+        // Rounded, bordered text field.
+        GradientDrawable field = new GradientDrawable();
+        field.setColor(0xFFF2F4F8);
+        field.setCornerRadius(dp(22));
+        field.setStroke(dp(1), 0xFFD8DDE6);
+        input.setBackground(field);
+        input.setPadding(dp(16), dp(10), dp(16), dp(10));
+
+        styleSend(true);
+    }
+
+    private void styleSend(boolean enabled) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(enabled ? COLOR_SEND : COLOR_SEND_DISABLED);
+        send.setBackground(bg);
+    }
+
+    // ---------------------------------------------------------------- bubbles
+
+    private TextView addBubble(boolean user, String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        tv.setTextColor(user ? COLOR_USER_TEXT : COLOR_BOT_TEXT);
+        tv.setLineSpacing(0f, 1.12f);
+        tv.setMaxWidth(maxBubbleWidth);
+        tv.setPadding(dp(14), dp(10), dp(14), dp(10));
+        tv.setTextIsSelectable(true);
+        tv.setMovementMethod(LinkMovementMethod.getInstance());
+
+        float r = dp(18);
+        float s = dp(5);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(user ? COLOR_USER : COLOR_BOT);
+        if (!user) {
+            bg.setStroke(dp(1), COLOR_BOT_STROKE);
+        }
+        // Flatten the corner nearest the sender for a subtle "tail".
+        // order: TL, TR, BR, BL (x,y pairs)
+        if (user) {
+            bg.setCornerRadii(new float[]{r, r, r, r, s, s, r, r});
+        } else {
+            bg.setCornerRadii(new float[]{r, r, r, r, r, r, s, s});
+        }
+        tv.setBackground(bg);
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.gravity = user ? Gravity.END : Gravity.START;
+        lp.topMargin = dp(4);
+        lp.bottomMargin = dp(4);
+        tv.setLayoutParams(lp);
+
+        container.addView(tv);
+        scrollToBottom();
+        return tv;
+    }
+
+    private void addSystemNote(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tv.setTextColor(COLOR_HINT_TEXT);
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(dp(8), dp(6), dp(8), dp(10));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        tv.setLayoutParams(lp);
+        container.addView(tv);
+    }
+
+    private void scrollToBottom() {
+        scroll.post(new Runnable() {
+            @Override
+            public void run() {
+                scroll.fullScroll(View.FOCUS_DOWN);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- sending
 
     private void onSend() {
         final String text = input.getText().toString().trim();
@@ -87,17 +202,18 @@ public class MainActivity extends Activity {
         }
         input.setText("");
         setBusy(true);
-        appendLine("You: " + text);
+        addBubble(true, text);
 
-        // Record the user turn in the conversation history.
         try {
             JSONObject msg = new JSONObject();
             msg.put("role", "user");
             msg.put("content", text);
             history.put(msg);
-        } catch (Exception e) {
-            // JSONObject.put only throws on null keys; cannot happen here.
+        } catch (Exception ignored) {
         }
+
+        // Placeholder "typing" bubble, replaced in place when the reply lands.
+        final TextView pending = addBubble(false, "…");
 
         new Thread(new Runnable() {
             @Override
@@ -116,8 +232,8 @@ public class MainActivity extends Activity {
                 ui.post(new Runnable() {
                     @Override
                     public void run() {
+                        pending.setText(finalReply);
                         if (finalOk) {
-                            appendLine("Ollama: " + finalReply + "\n");
                             try {
                                 JSONObject msg = new JSONObject();
                                 msg.put("role", "assistant");
@@ -125,10 +241,9 @@ public class MainActivity extends Activity {
                                 history.put(msg);
                             } catch (Exception ignored) {
                             }
-                        } else {
-                            appendLine(finalReply + "\n");
                         }
                         setBusy(false);
+                        scrollToBottom();
                     }
                 });
             }
@@ -198,17 +313,8 @@ public class MainActivity extends Activity {
 
     private void setBusy(boolean busy) {
         send.setEnabled(!busy);
-        send.setText(busy ? "…" : getString(R.string.send));
+        send.setText(busy ? "…" : "↑");
+        styleSend(!busy);
         input.setEnabled(!busy);
-    }
-
-    private void appendLine(String line) {
-        conversation.append(line + "\n");
-        scroll.post(new Runnable() {
-            @Override
-            public void run() {
-                scroll.fullScroll(View.FOCUS_DOWN);
-            }
-        });
     }
 }
