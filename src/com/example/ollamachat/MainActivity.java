@@ -20,30 +20,41 @@ import android.widget.TextView;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.Charset;
+import java.util.concurrent.TimeUnit;
+
+import io.noties.markwon.Markwon;
+
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.sse.EventSource;
+import okhttp3.sse.EventSourceListener;
+import okhttp3.sse.EventSources;
 
 /**
- * Minimal Ollama chat client.
+ * Minimal Ollama chat client with real-time streaming + Markdown rendering.
  *
- * Talks to a local Ollama server over its HTTP /api/chat endpoint, keeping the
- * running conversation in memory so the model has context across turns.
- * Pure Android framework only — no Compose, no support/AndroidX libraries.
- * The chat bubbles are built programmatically (rounded GradientDrawables) so
- * the project ships without any drawable assets.
+ * Streaming uses OkHttp's standard Server-Sent Events API (okhttp-sse,
+ * {@link EventSource}) against Ollama's OpenAI-compatible endpoint
+ * {@code /v1/chat/completions}, which emits a genuine {@code text/event-stream}
+ * (Ollama's native {@code /api/chat} is newline-delimited JSON, not SSE).
+ * Each {@code data:} chunk carries an OpenAI-style delta whose
+ * {@code choices[0].delta.content} is appended live; the stream ends with
+ * {@code data: [DONE]}.
+ *
+ * Markdown (bold, lists, code blocks, …) is rendered with Markwon. Pure
+ * framework UI otherwise — no Compose, no AndroidX widgets.
  */
 public class MainActivity extends Activity {
 
-    /** Ollama server endpoint and model. Edit these two lines to point elsewhere. */
-    private static final String SERVER_URL = "http://192.168.1.186:11434/api/chat";
+    /** Ollama server base + model. Edit these two lines to point elsewhere. */
+    private static final String SERVER = "http://192.168.1.186:11434";
     private static final String MODEL = "qwen3:30b-a3b-instruct-2507-q4_K_M";
 
-    private static final Charset UTF8 = Charset.forName("UTF-8");
+    private static final String ENDPOINT = SERVER + "/v1/chat/completions";
+    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
     // Palette
     private static final int COLOR_USER = 0xFF0B5FFF;
@@ -58,12 +69,20 @@ public class MainActivity extends Activity {
     private final JSONArray history = new JSONArray();
     private final Handler ui = new Handler(Looper.getMainLooper());
 
+    private OkHttpClient client;
+    private Markwon markwon;
+
     private LinearLayout container;
     private ScrollView scroll;
     private EditText input;
     private Button send;
     private float density;
     private int maxBubbleWidth;
+
+    // Streaming state for the in-flight assistant turn.
+    private final StringBuilder current = new StringBuilder();
+    private TextView pendingBubble;
+    private boolean renderScheduled;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -78,6 +97,12 @@ public class MainActivity extends Activity {
         scroll = (ScrollView) findViewById(R.id.scroll);
         input = (EditText) findViewById(R.id.input);
         send = (Button) findViewById(R.id.send);
+
+        markwon = Markwon.create(this);
+        client = new OkHttpClient.Builder()
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS) // no timeout while streaming
+                .build();
 
         styleInputBar();
 
@@ -99,8 +124,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        addSystemNote("Connected to " + SERVER_URL.replace("/api/chat", "")
-                + "\n" + MODEL);
+        addSystemNote("Streaming from " + SERVER + "\n" + MODEL);
     }
 
     // ---------------------------------------------------------------- styling
@@ -110,14 +134,12 @@ public class MainActivity extends Activity {
     }
 
     private void styleInputBar() {
-        // Rounded, bordered text field.
         GradientDrawable field = new GradientDrawable();
         field.setColor(0xFFF2F4F8);
         field.setCornerRadius(dp(22));
         field.setStroke(dp(1), 0xFFD8DDE6);
         input.setBackground(field);
         input.setPadding(dp(16), dp(10), dp(16), dp(10));
-
         styleSend(true);
     }
 
@@ -130,9 +152,8 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- bubbles
 
-    private TextView addBubble(boolean user, String text) {
+    private TextView addBubble(boolean user) {
         TextView tv = new TextView(this);
-        tv.setText(text);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         tv.setTextColor(user ? COLOR_USER_TEXT : COLOR_BOT_TEXT);
         tv.setLineSpacing(0f, 1.12f);
@@ -148,8 +169,7 @@ public class MainActivity extends Activity {
         if (!user) {
             bg.setStroke(dp(1), COLOR_BOT_STROKE);
         }
-        // Flatten the corner nearest the sender for a subtle "tail".
-        // order: TL, TR, BR, BL (x,y pairs)
+        // Flatten the corner nearest the sender for a subtle "tail". order: TL,TR,BR,BL
         if (user) {
             bg.setCornerRadii(new float[]{r, r, r, r, s, s, r, r});
         } else {
@@ -177,10 +197,9 @@ public class MainActivity extends Activity {
         tv.setTextColor(COLOR_HINT_TEXT);
         tv.setGravity(Gravity.CENTER);
         tv.setPadding(dp(8), dp(6), dp(8), dp(10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        tv.setLayoutParams(new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        tv.setLayoutParams(lp);
+                LinearLayout.LayoutParams.WRAP_CONTENT));
         container.addView(tv);
     }
 
@@ -202,113 +221,145 @@ public class MainActivity extends Activity {
         }
         input.setText("");
         setBusy(true);
-        addBubble(true, text);
 
+        TextView userBubble = addBubble(true);
+        userBubble.setText(text);
+        appendHistory("user", text);
+
+        // Fresh streaming bubble for the assistant reply.
+        current.setLength(0);
+        pendingBubble = addBubble(false);
+        pendingBubble.setText("…");
+
+        startStream();
+    }
+
+    private void startStream() {
+        String payload;
+        try {
+            JSONObject body = new JSONObject();
+            body.put("model", MODEL);
+            body.put("messages", history);
+            body.put("stream", true);
+            payload = body.toString();
+        } catch (Exception e) {
+            finishStream("[error] " + e.getMessage(), false);
+            return;
+        }
+
+        Request request = new Request.Builder()
+                .url(ENDPOINT)
+                .header("Accept", "text/event-stream")
+                .post(RequestBody.create(JSON, payload))
+                .build();
+
+        EventSources.createFactory(client).newEventSource(request, new EventSourceListener() {
+            @Override
+            public void onEvent(EventSource es, String id, String type, String data) {
+                if (data == null || "[DONE]".equals(data)) {
+                    return;
+                }
+                String delta = extractDelta(data);
+                if (delta.length() > 0) {
+                    synchronized (current) {
+                        current.append(delta);
+                    }
+                    scheduleRender();
+                }
+            }
+
+            @Override
+            public void onClosed(EventSource es) {
+                String md;
+                synchronized (current) {
+                    md = current.toString();
+                }
+                finishStream(md.length() == 0 ? "[no response]" : md, true);
+            }
+
+            @Override
+            public void onFailure(EventSource es, Throwable t, Response response) {
+                String detail;
+                if (t != null && t.getMessage() != null) {
+                    detail = t.getMessage();
+                } else if (response != null) {
+                    detail = "HTTP " + response.code();
+                } else {
+                    detail = "connection failed";
+                }
+                finishStream("[error] " + detail, false);
+            }
+        });
+    }
+
+    /** Pull choices[0].delta.content out of one OpenAI-style SSE data chunk. */
+    private static String extractDelta(String data) {
+        try {
+            JSONObject obj = new JSONObject(data);
+            JSONArray choices = obj.optJSONArray("choices");
+            if (choices == null || choices.length() == 0) {
+                return "";
+            }
+            JSONObject delta = choices.getJSONObject(0).optJSONObject("delta");
+            if (delta == null) {
+                return "";
+            }
+            return delta.optString("content", "");
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** Coalesce rapid token deltas into ~20fps Markdown re-renders on the UI thread. */
+    private void scheduleRender() {
+        if (renderScheduled) {
+            return;
+        }
+        renderScheduled = true;
+        ui.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                renderScheduled = false;
+                if (pendingBubble == null) {
+                    return;
+                }
+                String md;
+                synchronized (current) {
+                    md = current.toString();
+                }
+                markwon.setMarkdown(pendingBubble, md);
+                scrollToBottom();
+            }
+        }, 50);
+    }
+
+    private void finishStream(final String finalText, final boolean ok) {
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                if (pendingBubble != null) {
+                    if (ok) {
+                        markwon.setMarkdown(pendingBubble, finalText);
+                        appendHistory("assistant", finalText);
+                    } else {
+                        pendingBubble.setText(finalText);
+                    }
+                }
+                pendingBubble = null;
+                setBusy(false);
+                scrollToBottom();
+            }
+        });
+    }
+
+    private void appendHistory(String role, String content) {
         try {
             JSONObject msg = new JSONObject();
-            msg.put("role", "user");
-            msg.put("content", text);
+            msg.put("role", role);
+            msg.put("content", content);
             history.put(msg);
         } catch (Exception ignored) {
         }
-
-        // Placeholder "typing" bubble, replaced in place when the reply lands.
-        final TextView pending = addBubble(false, "…");
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                String reply;
-                boolean ok;
-                try {
-                    reply = requestChat();
-                    ok = true;
-                } catch (Exception e) {
-                    reply = "[error] " + e.getMessage();
-                    ok = false;
-                }
-                final String finalReply = reply;
-                final boolean finalOk = ok;
-                ui.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        pending.setText(finalReply);
-                        if (finalOk) {
-                            try {
-                                JSONObject msg = new JSONObject();
-                                msg.put("role", "assistant");
-                                msg.put("content", finalReply);
-                                history.put(msg);
-                            } catch (Exception ignored) {
-                            }
-                        }
-                        setBusy(false);
-                        scrollToBottom();
-                    }
-                });
-            }
-        }).start();
-    }
-
-    /** Performs a blocking (stream:false) /api/chat request and returns the reply text. */
-    private String requestChat() throws Exception {
-        JSONObject body = new JSONObject();
-        body.put("model", MODEL);
-        body.put("messages", history);
-        body.put("stream", false);
-
-        HttpURLConnection conn = (HttpURLConnection) new URL(SERVER_URL).openConnection();
-        try {
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(15000);
-            // Large local models can take a while to generate; allow up to 5 min.
-            conn.setReadTimeout(300000);
-
-            byte[] payload = body.toString().getBytes(UTF8);
-            OutputStream os = conn.getOutputStream();
-            try {
-                os.write(payload);
-            } finally {
-                os.close();
-            }
-
-            int code = conn.getResponseCode();
-            InputStream in = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
-            String raw = readAll(in);
-
-            if (code < 200 || code >= 400) {
-                return "[HTTP " + code + "] " + raw;
-            }
-
-            JSONObject obj = new JSONObject(raw);
-            if (obj.has("message")) {
-                return obj.getJSONObject("message").optString("content", "").trim();
-            }
-            // Fallback for the /api/generate shape, just in case.
-            return obj.optString("response", raw).trim();
-        } finally {
-            conn.disconnect();
-        }
-    }
-
-    private static String readAll(InputStream in) throws Exception {
-        if (in == null) {
-            return "";
-        }
-        BufferedReader reader = new BufferedReader(new InputStreamReader(in, UTF8));
-        StringBuilder sb = new StringBuilder();
-        char[] buf = new char[4096];
-        int n;
-        try {
-            while ((n = reader.read(buf)) != -1) {
-                sb.append(buf, 0, n);
-            }
-        } finally {
-            reader.close();
-        }
-        return sb.toString();
     }
 
     private void setBusy(boolean busy) {
