@@ -3,7 +3,6 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="12dp"
     android:fitsSystemWindows="true">
 
     <ScrollView
@@ -11,23 +10,30 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:scrollbars="vertical">
+        android:clipToPadding="false"
+        android:paddingLeft="10dp"
+        android:paddingRight="10dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="8dp"
+        android:scrollbars="none">
 
-        <TextView
-            android:id="@+id/conversation"
+        <LinearLayout
+            android:id="@+id/container"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textSize="16sp"
-            android:textIsSelectable="true"
-            android:lineSpacingMultiplier="1.1"
-            android:paddingBottom="8dp" />
+            android:orientation="vertical" />
     </ScrollView>
 
     <LinearLayout
+        android:id="@+id/inputbar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
+        android:background="#FFFFFF"
+        android:paddingLeft="10dp"
+        android:paddingRight="10dp"
         android:paddingTop="8dp"
+        android:paddingBottom="8dp"
         android:gravity="center_vertical">
 
         <EditText
@@ -37,14 +43,23 @@
             android:layout_weight="1"
             android:hint="@string/hint_input"
             android:inputType="textCapSentences|textMultiLine"
-            android:maxLines="4"
+            android:maxLines="5"
+            android:textSize="16sp"
+            android:textColor="#1A1A1A"
+            android:textColorHint="#9AA0A6"
             android:imeOptions="actionSend" />
 
         <Button
             android:id="@+id/send"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:layout_marginStart="8dp"
-            android:text="@string/send" />
+            android:layout_marginLeft="8dp"
+            android:padding="0dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:textSize="20sp"
+            android:textColor="#FFFFFF"
+            android:text="↑" />
     </LinearLayout>
 </LinearLayout>
