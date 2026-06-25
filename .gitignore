@@ -1,0 +1,8 @@
+# Build intermediates
+/build/
+
+# Toolchain artifacts (android.jar is auto-fetched; keystore must stay local)
+/.buildtools/
+
+# apksigner v4 signature (not needed for sideload)
+*.idsig
